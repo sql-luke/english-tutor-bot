@@ -1,7 +1,6 @@
 import os
-import asyncio
 import uuid
-import traceback # 新增：用來捕捉詳細錯誤訊息
+import traceback
 from flask import Flask, request, abort, send_from_directory
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -15,7 +14,7 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from google import genai
-import edge_tts
+from gtts import gTTS  # 新增：Google 語音套件
 from mutagen.mp3 import MP3
 
 app = Flask(__name__)
@@ -49,11 +48,6 @@ def callback():
         abort(400)
     return 'OK'
 
-async def create_audio(text, filepath):
-    communicate = edge_tts.Communicate(text, "zh-TW-HsiaoChenNeural", rate="+0%")
-    await communicate.save(filepath)
-
-# ================= 修改這裡：加入防護機制 =================
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_message = event.message.text
@@ -76,10 +70,13 @@ def handle_message(event):
             )
             ai_reply_text = response.text
 
-            # 2. 生成語音檔
+            # 2. 生成語音檔 (改用 gTTS)
             filename = f"{uuid.uuid4()}.mp3"
             filepath = os.path.join('static', filename)
-            asyncio.run(create_audio(ai_reply_text, filepath))
+            
+            # lang='zh-tw' 支援中文發音，遇到英文時也會自動切換成英文發音
+            tts = gTTS(text=ai_reply_text, lang='zh-tw')
+            tts.save(filepath)
             
             # 讀取音檔長度
             audio = MP3(filepath)
@@ -89,7 +86,7 @@ def handle_message(event):
             host_url = request.host_url.replace("http://", "https://").rstrip('/')
             audio_url = f"{host_url}/audio/{filename}"
 
-            # 4. 正常推播
+            # 4. 推播文字與語音回 LINE
             line_bot_api.reply_message_with_http_info(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
@@ -101,11 +98,8 @@ def handle_message(event):
             )
             
         except Exception as e:
-            # 發生錯誤時的急救措施：把錯誤訊息印出來並傳到 LINE
             error_msg = f"系統發生錯誤了！原因如下：\n{str(e)}\n\n請檢查 Render Logs 或截圖給開發協助者。"
-            print(traceback.format_exc()) # 將詳細錯誤寫入 Render 後台日誌
-            
-            # 嘗試只回傳文字訊息 (略過語音)
+            print(traceback.format_exc())
             try:
                 line_bot_api.reply_message_with_http_info(
                     ReplyMessageRequest(
@@ -114,7 +108,7 @@ def handle_message(event):
                     )
                 )
             except:
-                pass # 如果連傳文字都失敗就放生
+                pass
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
