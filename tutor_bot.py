@@ -15,16 +15,13 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from google import genai
+from google.genai import types # 新增：用來設定系統提示詞的套件
 import edge_tts
 from gtts import gTTS
 from mutagen.mp3 import MP3
 
 # ================= 語音設定控制面板 =================
-# 允哲 (台灣男聲，沉穩): "zh-TW-YunJheNeural"
-# 曉臻 (台灣女聲，清脆): "zh-TW-HsiaoChenNeural"
 TTS_VOICE = "zh-TW-YunJheNeural"
-
-# 語速調整 ("+0%" 為正常速度，"+10%" 為快 10%，"-10%" 為慢 10%)
 TTS_RATE = "+0%"
 # ====================================================
 
@@ -41,9 +38,14 @@ configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+# ================= 記憶體字典 =================
+# 用來儲存每一個 LINE 用戶的專屬對話紀錄
+user_chats = {}
+# =============================================
+
 @app.route("/", methods=['GET'])
 def hello():
-    return "Tutor Bot Server is running on cloud with Edge TTS + gTTS fallback!"
+    return "Tutor Bot Server is running with Memory capability!"
 
 @app.route("/audio/<filename>", methods=['GET'])
 def serve_audio(filename):
@@ -59,7 +61,6 @@ def callback():
         abort(400)
     return 'OK'
 
-# 定義 Edge TTS 生成函數
 async def create_edge_audio(text, filepath):
     communicate = edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE)
     await communicate.save(filepath)
@@ -68,22 +69,30 @@ async def create_edge_audio(text, filepath):
 def handle_message(event):
     user_message = event.message.text
     
+    # 取得傳送訊息的 LINE 使用者 ID
+    user_id = event.source.user_id
+    
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
         
         try:
-            # 1. 向 Gemini 請求回覆
-            prompt = f"""
-            你現在是一位親切的英文家教。
-            請根據學生的輸入「{user_message}」進行回應。
-            如果是單字，請提供例句；如果是文法錯誤，請糾正；如果是中文，請教他怎麼用英文表達。
-            注意：請務必只用「純文字」回覆，**絕對不要使用任何 Markdown 符號（如 ** 或 * 或 #）**，否則語音系統會把符號唸出來。
-            """
+            # 1. 處理 Gemini 對話記憶
+            # 如果這個使用者是第一次傳訊息，幫他開一個專屬的「聊天室」並注入家教人設
+            if user_id not in user_chats:
+                user_chats[user_id] = client.chats.create(
+                    model='gemini-2.5-flash',
+                    config=types.GenerateContentConfig(
+                        system_instruction="""
+                        你現在是一位親切的英文家教。
+                        請根據學生的輸入進行回應。
+                        如果是單字，請提供例句；如果是文法錯誤，請糾正；如果是中文，請教他怎麼用英文表達。
+                        注意：請務必只用「純文字」回覆，**絕對不要使用任何 Markdown 符號（如 ** 或 * 或 #）**，否則語音系統會把符號唸出來。
+                        """
+                    )
+                )
             
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=prompt
-            )
+            # 將學生的訊息傳送到該專屬聊天室 (Gemini 會自動帶入先前的歷史紀錄)
+            response = user_chats[user_id].send_message(user_message)
             ai_reply_text = response.text
 
             # 2. 生成語音檔 (雙重保險機制)
@@ -91,12 +100,9 @@ def handle_message(event):
             filepath = os.path.join('static', filename)
             
             try:
-                # 優先嘗試 Edge TTS (高品質男聲/女聲)
                 asyncio.run(create_edge_audio(ai_reply_text, filepath))
-                print("成功使用 Edge TTS 生成語音")
             except Exception as e:
-                # 若遭微軟阻擋 (403)，自動切換回 gTTS (基礎女聲)
-                print(f"Edge TTS 失敗，啟動 gTTS 備援機制: {e}")
+                print(f"Edge TTS 失敗，啟動 gTTS: {e}")
                 tts = gTTS(text=ai_reply_text, lang='zh-tw')
                 tts.save(filepath)
             
@@ -104,11 +110,10 @@ def handle_message(event):
             audio = MP3(filepath)
             duration_ms = int(audio.info.length * 1000)
             
-            # 3. 修正網址：強制替換 http 為 https
+            # 3. 修正網址並推播
             host_url = request.host_url.replace("http://", "https://").rstrip('/')
             audio_url = f"{host_url}/audio/{filename}"
 
-            # 4. 推播文字與語音回 LINE
             line_bot_api.reply_message_with_http_info(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
