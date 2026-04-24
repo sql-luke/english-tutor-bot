@@ -76,7 +76,7 @@ def handle_message(event):
             # 1. 處理 Gemini 對話記憶與【全能家教人設】
             if user_id not in user_chats:
                 user_chats[user_id] = client.chats.create(
-                    model='gemini-2.5-pro',
+                    model='gemini-2.0-flash',
                     config=types.GenerateContentConfig(
                         system_instruction="""
                         你現在是一位名叫「允哲」的專屬英文家教，具備對話引導、嚴格糾錯與單字解析的三重能力。
