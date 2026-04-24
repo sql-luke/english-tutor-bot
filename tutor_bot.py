@@ -1,5 +1,6 @@
 import os
 import uuid
+import asyncio
 import traceback
 from flask import Flask, request, abort, send_from_directory
 from linebot.v3 import WebhookHandler
@@ -14,8 +15,18 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from google import genai
-from gtts import gTTS  # 新增：Google 語音套件
+import edge_tts
+from gtts import gTTS
 from mutagen.mp3 import MP3
+
+# ================= 語音設定控制面板 =================
+# 允哲 (台灣男聲，沉穩): "zh-TW-YunJheNeural"
+# 曉臻 (台灣女聲，清脆): "zh-TW-HsiaoChenNeural"
+TTS_VOICE = "zh-TW-YunJheNeural"
+
+# 語速調整 ("+0%" 為正常速度，"+10%" 為快 10%，"-10%" 為慢 10%)
+TTS_RATE = "+0%"
+# ====================================================
 
 app = Flask(__name__)
 
@@ -32,7 +43,7 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 @app.route("/", methods=['GET'])
 def hello():
-    return "Tutor Bot Server is running on cloud!"
+    return "Tutor Bot Server is running on cloud with Edge TTS + gTTS fallback!"
 
 @app.route("/audio/<filename>", methods=['GET'])
 def serve_audio(filename):
@@ -47,6 +58,11 @@ def callback():
     except InvalidSignatureError:
         abort(400)
     return 'OK'
+
+# 定義 Edge TTS 生成函數
+async def create_edge_audio(text, filepath):
+    communicate = edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE)
+    await communicate.save(filepath)
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
@@ -70,13 +86,19 @@ def handle_message(event):
             )
             ai_reply_text = response.text
 
-            # 2. 生成語音檔 (改用 gTTS)
+            # 2. 生成語音檔 (雙重保險機制)
             filename = f"{uuid.uuid4()}.mp3"
             filepath = os.path.join('static', filename)
             
-            # lang='zh-tw' 支援中文發音，遇到英文時也會自動切換成英文發音
-            tts = gTTS(text=ai_reply_text, lang='zh-tw')
-            tts.save(filepath)
+            try:
+                # 優先嘗試 Edge TTS (高品質男聲/女聲)
+                asyncio.run(create_edge_audio(ai_reply_text, filepath))
+                print("成功使用 Edge TTS 生成語音")
+            except Exception as e:
+                # 若遭微軟阻擋 (403)，自動切換回 gTTS (基礎女聲)
+                print(f"Edge TTS 失敗，啟動 gTTS 備援機制: {e}")
+                tts = gTTS(text=ai_reply_text, lang='zh-tw')
+                tts.save(filepath)
             
             # 讀取音檔長度
             audio = MP3(filepath)
@@ -98,7 +120,7 @@ def handle_message(event):
             )
             
         except Exception as e:
-            error_msg = f"系統發生錯誤了！原因如下：\n{str(e)}\n\n請檢查 Render Logs 或截圖給開發協助者。"
+            error_msg = f"系統發生錯誤了！原因如下：\n{str(e)}"
             print(traceback.format_exc())
             try:
                 line_bot_api.reply_message_with_http_info(
