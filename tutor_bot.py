@@ -21,7 +21,7 @@ from gtts import gTTS
 from mutagen.mp3 import MP3
 
 # ================= 語音設定控制面板 =================
-TTS_VOICE = "zh-TW-YunJheNeural" # 允哲 男聲
+TTS_VOICE = "zh-TW-HsiaoChenNeural" # 允哲 男聲
 TTS_RATE = "+0%"
 # ====================================================
 
