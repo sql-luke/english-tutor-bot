@@ -2,6 +2,7 @@ import os
 import uuid
 import asyncio
 import traceback
+import json
 from flask import Flask, request, abort, send_from_directory
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -13,12 +14,15 @@ from linebot.v3.messaging import (
     TextMessage,
     AudioMessage
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from google import genai
-from google.genai import types 
+from google.genai import types
 import edge_tts
 from gtts import gTTS
 from mutagen.mp3 import MP3
+
+# 匯入 Firebase 套件
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 # ================= 語音設定控制面板 =================
 TTS_VOICE = "zh-TW-HsiaoChenNeural" # 曉臻 女聲
@@ -38,13 +42,22 @@ configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# ================= 記憶體字典 =================
-user_chats = {}
-# =============================================
+# ================= 初始化 Firebase =================
+# 從 Render 環境變數讀取 JSON 字串並轉換為字典
+firebase_env = os.getenv('FIREBASE_SERVICE_ACCOUNT')
+if firebase_env:
+    firebase_cert = json.loads(firebase_env)
+    cred = credentials.Certificate(firebase_cert)
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+else:
+    print("警告：未設定 FIREBASE_SERVICE_ACCOUNT 環境變數！")
+    db = None
+# ====================================================
 
 @app.route("/", methods=['GET'])
 def hello():
-    return "Tutor Bot Server is running with Ultimate Memory and Prompt!"
+    return "Tutor Bot Server is running with Firebase Database!"
 
 @app.route("/audio/<filename>", methods=['GET'])
 def serve_audio(filename):
@@ -73,38 +86,65 @@ def handle_message(event):
         line_bot_api = MessagingApi(api_client)
         
         try:
-            # 1. 處理 Gemini 對話記憶與【全能家教人設】
-            if user_id not in user_chats:
-                user_chats[user_id] = client.chats.create(
-                    model='gemini-2.5-flash',
-                    config=types.GenerateContentConfig(
-                        system_instruction="""
-                        你現在是一位名叫「允哲」的專屬英文家教，具備對話引導、嚴格糾錯與單字解析的三重能力。
-                        請根據學生的輸入，自動切換最適合的教學模式，並遵守以下原則：
-
-                        1. 【單字解析模式】(當學生只輸入一個單字或詢問某個詞的英文時)：
-                           - 提供該單字的詞性、KK音標(純英文字母)、中文意思。
-                           - 提供2個生活實用例句。
-                           - 補充1到2個同義詞或反義詞。
-                           - 出一個包含該單字的情境翻譯題或填空題考學生。
-
-                        2. 【文法糾錯與對話模式】(當學生輸入完整句子或一段話時)：
-                           - 先仔細檢查有沒有拼字或文法錯誤。如果有，請友善地指出錯誤、解釋原因，並給出正確的句子。
-                           - 針對學生說的話題，像朋友一樣給予自然的回應。
-                           - 在回覆的最後，主動提出一個與該話題相關的「英文問句」，引導學生繼續往下聊。
-
-                        3. 【通用嚴格限制】(非常重要)：
-                           - 請務必只用「純文字」回覆。
-                           - 絕對不要使用任何 Markdown 符號（例如星號、井字號、粗體等），否則語音系統會發出奇怪的讀音。
-                           - 說話語氣請保持親切、專業且具備鼓勵性。
-                        """
+            # 1. 處理 Firebase 對話記憶提取
+            history_data = []
+            if db:
+                doc_ref = db.collection('user_chats').document(user_id)
+                doc = doc_ref.get()
+                if doc.exists:
+                    history_data = doc.to_dict().get('history', [])
+            
+            # 將一般字典轉換為 Gemini 支援的 Content 格式
+            gemini_history = []
+            for msg in history_data:
+                gemini_history.append(
+                    types.Content(
+                        role=msg['role'],
+                        parts=[types.Part.from_text(text=msg['text'])]
                     )
                 )
+
+            # 2. 建立帶有歷史記憶的 Gemini Chat Session
+            chat = client.chats.create(
+                model='gemini-2.5-flash',
+                config=types.GenerateContentConfig(
+                    system_instruction="""
+                    你現在是一位名叫「曉臻」的專屬英文家教，具備對話引導、嚴格糾錯與單字解析的三重能力。
+                    請根據學生的輸入，自動切換最適合的教學模式，並遵守以下原則：
+
+                    1. 【單字解析模式】(當學生只輸入一個單字或詢問某個詞的英文時)：
+                       - 提供該單字的詞性、KK音標(純英文字母)、中文意思。
+                       - 提供2個生活實用例句。
+                       - 補充1到2個同義詞或反義詞。
+                       - 出一個包含該單字的情境翻譯題或填空題考學生。
+
+                    2. 【文法糾錯與對話模式】(當學生輸入完整句子或一段話時)：
+                       - 先仔細檢查有沒有拼字或文法錯誤。如果有，請友善地指出錯誤、解釋原因，並給出正確的句子。
+                       - 針對學生說的話題，像朋友一樣給予自然的回應。
+                       - 在回覆的最後，主動提出一個與該話題相關的「英文問句」，引導學生繼續往下聊。
+
+                    3. 【通用嚴格限制】(非常重要)：
+                       - 請務必只用「純文字」回覆。
+                       - 絕對不要使用任何 Markdown 符號（例如星號、井字號、粗體等），否則語音系統會發出奇怪的讀音。
+                       - 說話語氣請保持親切、專業且具備鼓勵性。
+                    """
+                ),
+                history=gemini_history if gemini_history else None
+            )
             
-            response = user_chats[user_id].send_message(user_message)
+            response = chat.send_message(user_message)
             ai_reply_text = response.text
 
-            # 2. 生成語音檔
+            # 3. 將最新對話存回 Firebase
+            if db:
+                history_data.append({"role": "user", "text": user_message})
+                history_data.append({"role": "model", "text": ai_reply_text})
+                
+                # 記憶體長度限制：只保留最後 20 句 (10組對話)，避免資料庫過大
+                history_data = history_data[-20:]
+                doc_ref.set({'history': history_data}, merge=True)
+
+            # 4. 生成語音檔
             filename = f"{uuid.uuid4()}.mp3"
             filepath = os.path.join('static', filename)
             
@@ -119,7 +159,7 @@ def handle_message(event):
             audio = MP3(filepath)
             duration_ms = int(audio.info.length * 1000)
             
-            # 3. 修正網址並推播
+            # 5. 修正網址並推播
             host_url = request.host_url.replace("http://", "https://").rstrip('/')
             audio_url = f"{host_url}/audio/{filename}"
 
